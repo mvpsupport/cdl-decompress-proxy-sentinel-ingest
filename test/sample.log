@@ -1,0 +1,8 @@
+[
+    {
+        "TimeGenerated": "2025-08-13T12:00:00Z",
+        "Computer": "TestPC",
+        "EventID": 5145,
+        "Message": "This is a test log entry."
+    }
+]

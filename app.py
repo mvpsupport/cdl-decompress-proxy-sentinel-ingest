@@ -15,15 +15,15 @@ import hmac
 app = Flask(__name__)
 
 
-WORKSPACE_ID = os.environ.get('WORKSPACE_ID')
-SHARED_KEY = os.environ.get('SHARED_KEY')
+WORKSPACE_ID = os.environ.get('workspaceId')
+SHARED_KEY = os.environ.get('sharedKey')
+API_KEY = os.environ.get('API_KEY')
 
 
-if (WORKSPACE_ID is None or SHARED_KEY is None):
-    raise Exception("Please add azure sentinel customer_id and shared_key to azure key vault/application settings of web app") 
+if (WORKSPACE_ID is None or SHARED_KEY is None or API_KEY is None):
+    raise Exception("Please add WORKSPACE_ID, SHARED_KEY and API_KEY to azure key vault/application settings of web app") 
 
 
-BASIC_AUTH = base64.b64encode("{}:{}".format(WORKSPACE_ID, SHARED_KEY).encode()).decode("utf-8")
 LOG_TYPE = 'Log-Type'
 HTTPS = 'https://'
 AZURE_URL = '.ods.opinsights.azure.com'
@@ -58,92 +58,67 @@ def build_signature(customer_id, shared_key, date, content_length, method, conte
     return authorization
 
 
-def post(headers, body, isAuth):
-    auth_string = ' auth ' if isAuth else ' '
+def post(headers, body):
     response = POOL.post(URI, data=body, headers=headers)
-    if (response.status_code >= 200 and response.status_code <= 299):
-        logging.debug('accepted {}'.format(auth_string))
-    else:
-        resp_body = str(response.json())
+    if not (200 <= response.status_code <= 299):
+        try:
+            resp_body = str(response.json())
+        except json.JSONDecodeError:
+            resp_body = response.text
         resp_headers = json.dumps(headers)
-        failure_resp = "failure{}response details: {}{}{}".format(auth_string, response.status_code, resp_body, resp_headers)
-        raise ProcessingException("ProcessingException for{}: {}".format(auth_string, failure_resp)) 
+        failure_resp = "failure response details: {}{}{}".format(response.status_code, resp_body, resp_headers)
+        raise ProcessingException("ProcessingException: {}".format(failure_resp))
 
 
 # Build Auth and send request to the POST API
-def post_data(customer_id, shared_key, body, log_type, length=0):
+def post_data(customer_id, shared_key, body, log_type):
     rfc1123date = datetime.datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT')
-    signature = build_signature(customer_id, shared_key, rfc1123date, length, POST_METHOD, CONTENT_TYPE, RESOURCE)
+    content_length = len(body)
+    signature = build_signature(customer_id, shared_key, rfc1123date, content_length, POST_METHOD, CONTENT_TYPE, RESOURCE)
     headers = {
         'content-type': CONTENT_TYPE,
         'Authorization': signature,
         'Log-Type': log_type,
         'x-ms-date': rfc1123date
     }
-    post(headers, body, False)
-
-
-# Use Auth and send request to the POST API
-def post_data_auth(headers, body):
-    post(headers, body, True)
+    post(headers, body)
 
 
 @app.route('/', methods=['POST'])
 def func():
-    auth_headers = request.headers.get("authorization").split(",")
+    auth_header = request.headers.get("authorization")
+    if auth_header is None or not auth_header.startswith("ApiKey "):
+        return FAILURE_RESPONSE, 401, APPLICATION_JSON
+
+    api_key_sent = auth_header.split("ApiKey ")[1]
+    if api_key_sent != API_KEY:
+        logging.error("UnAuthorized ApiKey header mismatch")
+        return FAILURE_RESPONSE, 401, APPLICATION_JSON
+
+    log_type = request.headers.get(LOG_TYPE)
+    if not log_type:
+        logging.error("Missing Log-Type header")
+        return FAILURE_RESPONSE, 400, APPLICATION_JSON
+
     body = request.get_data()
-    basic_auth_header = ''
-    shared_key_header = ''
+    
     try:
-        for auth in auth_headers:
-            if "Basic" in auth:
-                basic_auth_header = auth.strip()
-                if (basic_auth_header.split("Basic ")[1] != BASIC_AUTH):
-                    logging.error("UnAuthorized Basic header mismatch %s vs %s", basic_auth_header, BASIC_AUTH)
-                    raise UnAuthorizedException()
-            if "SharedKey" in auth:
-                shared_key_header = auth.strip()
-        if basic_auth_header == '':
-            logging.error("UnAuthorized Basic header")
-            raise UnAuthorizedException()   
-        log_type = request.headers.get(LOG_TYPE)
-        xms_date = ", ".join([each.strip() for each in request.headers.get('x-ms-date').split(",")]).replace("UTC", "GMT")
-        headers = {
-             'Content-Type': 'application/json; charset=UTF-8',
-             'Authorization': shared_key_header,
-             'Log-Type': log_type,
-             'x-ms-date': xms_date        
-        }
-        logging.debug(headers)
-        # Decompress payload
         decompressed = gzip.decompress(body)
-        logging.debug(decompressed)  
-        decomp_body_length = len(decompressed)
-        if decomp_body_length == 0:
-            if len(body) == 0:
-              logging.error("decompressed: {} vs body: {}".format(decompressed, body))
-              return FAILURE_RESPONSE, 400, APPLICATION_JSON 
-            else:
-              return FAILURE_RESPONSE, 500, APPLICATION_JSON 
-        # Use Authorization header from request
-        post_data_auth(headers, decompressed)
+        if not decompressed:
+            logging.error("Empty body after decompression")
+            return FAILURE_RESPONSE, 400, APPLICATION_JSON
+        
         logging.debug("processed request auth")
-    except ValueError as e:
-        logging.error("ValueError: {}{}{}".format(headers, e, decompressed))
-        return FAILURE_RESPONSE, 500, APPLICATION_JSON 
-    except UnAuthorizedException:
-        return FAILURE_RESPONSE, 401, APPLICATION_JSON 
+        post_data(WORKSPACE_ID, SHARED_KEY, decompressed, log_type)
+        
+    except gzip.BadGzipFile:
+        logging.error("Bad Gzip File")
+        return FAILURE_RESPONSE, 400, APPLICATION_JSON
     except ProcessingException as e:
-        logging.debug(e)
-        try:
-            # Create Authorization header
-            post_data(WORKSPACE_ID, SHARED_KEY, decompressed, log_type, length=decomp_body_length)
-            logging.debug("processed request by creating auth")
-        except ProcessingException as err:
-            logging.error("Exception: {}{}{}".format(headers, err, decompressed))
-            return FAILURE_RESPONSE, 500, APPLICATION_JSON 
+        logging.error("ProcessingException: %s", e)
+        return FAILURE_RESPONSE, 500, APPLICATION_JSON 
     except Exception as e:
-        logging.error(e)
+        logging.error("Exception: %s", e)
         return FAILURE_RESPONSE, 500, APPLICATION_JSON 
        
     return SUCCESS_RESPONSE, 200, APPLICATION_JSON 
